@@ -16,7 +16,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ /app/
 
-RUN useradd -m -u 1000 user1000 \
+RUN mkdir -p /app/logs \
+    && useradd -m -u 1000 user1000 \
     && chown -R user1000:user1000 /app
 USER 1000
 

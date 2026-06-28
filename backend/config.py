@@ -111,7 +111,25 @@ MCAP_REFRESH_MINUTES: Final[int] = 60
 SCAN_INTERVAL_SECONDS: Final[int] = 60
 
 WS_BASE_URL: Final[str] = "wss://stream.binance.com:9443/stream"
-REST_BASE_URL: Final[str] = "https://api.binance.com"
+# Cloud/HF gibi ortamlarda api.binance.com kısıtlı olabilir; Binance public
+# market data mirror'ı önce denenir (docs: data-api.binance.vision).
+_REST_ENV: Final[str] = os.getenv("BINANCE_REST_URL", "").strip()
+REST_BASE_URLS: Final[tuple[str, ...]] = tuple(
+    dict.fromkeys(
+        u
+        for u in (
+            _REST_ENV,
+            "https://data-api.binance.vision",
+            "https://api.binance.com",
+            "https://api1.binance.com",
+            "https://api2.binance.com",
+            "https://api3.binance.com",
+            "https://api4.binance.com",
+        )
+        if u
+    )
+)
+REST_BASE_URL: Final[str] = REST_BASE_URLS[0]
 CMC_BASE_URL: Final[str] = "https://pro-api.coinmarketcap.com"
 
 MCAP_GROUPS: Final[dict[str, tuple[float, float]]] = {
@@ -165,12 +183,9 @@ CRON_SECRET: Final[str] = os.getenv("CRON_SECRET", "")
 def configure_logging() -> None:
     """Tek noktadan logging yapılandırması.
 
-    Konsol + dosya (rotating) handler'ları kurar. Tam çıktı her zaman
-    `backend/logs/app.log` içine yazılır, böylece terminalden kopyalama
-    sorununda dosyadan okunabilir.
+    Konsol + dosya (rotating) handler'ları kurar. Docker/HF gibi salt
+    okunur kök dizinlerde yalnızca konsol log kullanılır.
     """
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
     level = getattr(logging, LOG_LEVEL, logging.INFO)
     formatter = logging.Formatter(LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
 
@@ -185,17 +200,26 @@ def configure_logging() -> None:
     console.setFormatter(formatter)
     root.addHandler(console)
 
-    # Vercel dosya sistemi salt okunur; yalnızca konsol log.
-    if not IS_VERCEL:
-        file_handler = RotatingFileHandler(
-            LOG_FILE,
-            maxBytes=10 * 1024 * 1024,
-            backupCount=5,
-            encoding="utf-8",
-        )
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(formatter)
-        root.addHandler(file_handler)
+    if IS_VERCEL:
+        logging.getLogger("websockets").setLevel(logging.WARNING)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        return
+
+    for log_dir in (BASE_DIR / "logs", BASE_DIR.parent / "logs"):
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            file_handler = RotatingFileHandler(
+                log_dir / "app.log",
+                maxBytes=10 * 1024 * 1024,
+                backupCount=5,
+                encoding="utf-8",
+            )
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(formatter)
+            root.addHandler(file_handler)
+            break
+        except OSError:
+            continue
 
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)

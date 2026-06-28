@@ -45,7 +45,7 @@ from config import (
     HTTP_TIMEOUT,
     MCAP_GROUPS,
     MCAP_REFRESH_MINUTES,
-    REST_BASE_URL,
+    REST_BASE_URLS,
     STABLECOIN_BLACKLIST,
 )
 
@@ -90,20 +90,38 @@ def _classify_symbols(usdt_symbols: list[str]) -> dict[str, list[str]]:
     return grouped
 
 
+async def _fetch_json_with_fallback(
+    client: httpx.AsyncClient,
+    path: str,
+    *,
+    label: str,
+) -> Any:
+    """REST_BASE_URLS sırasıyla dener; cloud IP kısıtlarında mirror'a düşer."""
+    last_error: MarketCapError | None = None
+    for base in REST_BASE_URLS:
+        url = f"{base}{path}"
+        try:
+            resp = await client.get(url)
+        except httpx.HTTPError as exc:
+            last_error = MarketCapError(f"{label} isteği başarısız ({base}): {exc}")
+            logger.warning("%s", last_error)
+            continue
+        if resp.status_code != 200:
+            last_error = MarketCapError(
+                f"{label} HTTP {resp.status_code} ({base}): {resp.text[:200]}"
+            )
+            logger.warning("%s", last_error)
+            continue
+        logger.info("%s OK → %s", label, base)
+        return resp.json()
+    raise last_error or MarketCapError(f"{label} tüm REST uç noktalarında başarısız.")
+
+
 async def _fetch_active_usdt_symbols(client: httpx.AsyncClient) -> set[str]:
     """exchangeInfo'dan aktif (TRADING) USDT çiftlerinin set'ini döner."""
-    url = f"{REST_BASE_URL}{EXCHANGE_INFO_ENDPOINT}"
-    try:
-        resp = await client.get(url)
-    except httpx.HTTPError as exc:
-        raise MarketCapError(f"exchangeInfo isteği başarısız: {exc}") from exc
-
-    if resp.status_code != 200:
-        raise MarketCapError(
-            f"exchangeInfo HTTP {resp.status_code}: {resp.text[:200]}"
-        )
-
-    payload = resp.json()
+    payload = await _fetch_json_with_fallback(
+        client, EXCHANGE_INFO_ENDPOINT, label="exchangeInfo"
+    )
     symbols_raw = payload.get("symbols")
     if not isinstance(symbols_raw, list):
         raise MarketCapError("exchangeInfo yanıtında 'symbols' listesi yok.")
@@ -137,18 +155,9 @@ async def _fetch_active_usdt_symbols(client: httpx.AsyncClient) -> set[str]:
 
 async def _fetch_24hr_tickers(client: httpx.AsyncClient) -> list[dict[str, Any]]:
     """ticker/24hr'dan tüm sembollerin 24 saatlik hacim ham verisini çeker."""
-    url = f"{REST_BASE_URL}{TICKER_24HR_ENDPOINT}"
-    try:
-        resp = await client.get(url)
-    except httpx.HTTPError as exc:
-        raise MarketCapError(f"ticker/24hr isteği başarısız: {exc}") from exc
-
-    if resp.status_code != 200:
-        raise MarketCapError(
-            f"ticker/24hr HTTP {resp.status_code}: {resp.text[:200]}"
-        )
-
-    data = resp.json()
+    data = await _fetch_json_with_fallback(
+        client, TICKER_24HR_ENDPOINT, label="ticker/24hr"
+    )
     if not isinstance(data, list):
         raise MarketCapError("ticker/24hr yanıtı liste değil.")
     return data

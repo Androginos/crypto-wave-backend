@@ -58,7 +58,7 @@ from config import (
     L_LEN_MAP,
     PERIOD_BAR_LIMITS,
     PERIOTS,
-    REST_BASE_URL,
+    REST_BASE_URLS,
     SCAN_INTERVAL_SECONDS,
     TV_DASHBOARD_LABELS,
     TV_DASHBOARD_PERIODS,
@@ -188,6 +188,10 @@ class MarketState:
         # WS connection durumu
         self.ws_connected: bool = False
         self.ws_last_message_at: float = 0.0
+        self.startup_error: str | None = None
+        self.backfill_complete: bool = False
+        self.rest_poll_active: bool = False
+        self.rest_poll_last_at: float = 0.0
 
         # Son 7 gün elit sinyal hafızası (Alpha History + Weekly Performance)
         # elite_history[symbol] = {
@@ -339,6 +343,34 @@ def _kline_to_row(kline: list) -> dict[str, Any]:
     }
 
 
+async def _binance_get(
+    client: httpx.AsyncClient,
+    path: str,
+    *,
+    params: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> httpx.Response:
+    """Public REST isteklerinde mirror uç noktalarını sırayla dener."""
+    last_exc: Exception | None = None
+    for base in REST_BASE_URLS:
+        try:
+            resp = await client.get(
+                f"{base}{path}", params=params, headers=headers or None
+            )
+            if resp.status_code == 200:
+                return resp
+            last_exc = httpx.HTTPStatusError(
+                f"HTTP {resp.status_code} via {base}",
+                request=resp.request,
+                response=resp,
+            )
+        except httpx.HTTPError as exc:
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Binance REST uç noktalarına ulaşılamadı.")
+
+
 async def fetch_klines(
     client: httpx.AsyncClient,
     symbol: str,
@@ -354,14 +386,14 @@ async def fetch_klines(
     if limit is None:
         limit = PERIOD_BAR_LIMITS.get(interval, KLINE_FETCH_LIMIT)
 
-    url = f"{REST_BASE_URL}/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
     headers: dict[str, str] = {}
     if BINANCE_API_KEY and "YENI_" not in BINANCE_API_KEY:
         headers["X-MBX-APIKEY"] = BINANCE_API_KEY
 
-    resp = await client.get(url, params=params, headers=headers)
-    resp.raise_for_status()
+    resp = await _binance_get(
+        client, "/api/v3/klines", params=params, headers=headers
+    )
     raw = resp.json()
 
     rows = [_kline_to_row(k) for k in raw]
@@ -385,14 +417,14 @@ async def fetch_orderbook_depth(
     limit: int = ORDERBOOK_DEPTH_LIMIT,
 ) -> list[tuple[float, float]]:
     """Binance emir defteri — ask tarafı (fiyat, miktar) listesi."""
-    url = f"{REST_BASE_URL}/api/v3/depth"
     params = {"symbol": symbol, "limit": str(limit)}
     headers: dict[str, str] = {}
     if BINANCE_API_KEY and "YENI_" not in BINANCE_API_KEY:
         headers["X-MBX-APIKEY"] = BINANCE_API_KEY
 
-    resp = await client.get(url, params=params, headers=headers)
-    resp.raise_for_status()
+    resp = await _binance_get(
+        client, "/api/v3/depth", params=params, headers=headers
+    )
     data = resp.json()
     return [(float(p), float(q)) for p, q in data.get("asks", [])]
 
@@ -443,6 +475,85 @@ async def backfill_symbol(
             await asyncio.sleep(0.1)
 
 
+async def rest_poll_symbol(
+    client: httpx.AsyncClient, symbol: str, semaphore: asyncio.Semaphore
+) -> int:
+    """WS yokken tek sembolün son kapalı mumlarını REST ile tazeler."""
+    new_bars = 0
+    async with semaphore:
+        for period in PERIOTS:
+            try:
+                df = await fetch_klines(client, symbol, period, limit=3)
+                if df.empty:
+                    continue
+                async with STATE.frame_locks[symbol]:
+                    existing = STATE.frames[symbol].get(period)
+                    before = (
+                        len(existing.index)
+                        if existing is not None and not existing.empty
+                        else 0
+                    )
+                    merged = _merge_rest_frames(existing, df, period)
+                    if merged is None or merged.empty:
+                        continue
+                    STATE.frames[symbol][period] = merged
+                    if len(merged.index) > before:
+                        new_bars += len(merged.index) - before
+            except httpx.HTTPStatusError as exc:
+                if exc.response is not None and exc.response.status_code == 400:
+                    logger.debug("REST poll atlandı %s %s", symbol, period)
+                else:
+                    logger.debug(
+                        "REST poll HTTP hatası %s %s: %s", symbol, period, exc
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("REST poll hatası %s %s: %s", symbol, period, exc)
+            await asyncio.sleep(0.05)
+    return new_bars
+
+
+async def rest_poll_loop() -> None:
+    """WS kapalıyken mum verisini REST mirror üzerinden periyodik tazeler.
+
+    Hugging Face gibi cloud ortamlarda Binance WebSocket erişilemez;
+    bu döngü sinyal motorunun canlı kalmasını sağlar. WS bağlıyken uyur.
+    """
+    while not STATE.backfill_complete:
+        await asyncio.sleep(5)
+
+    logger.info(
+        "REST poll hazır — WS yokken her ~%ss mum tazelemesi yapılacak.",
+        SCAN_INTERVAL_SECONDS,
+    )
+
+    while True:
+        if STATE.ws_connected:
+            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+            continue
+        if not STATE.symbols or HTTP_CLIENT is None:
+            await asyncio.sleep(15)
+            continue
+
+        started = time.monotonic()
+        semaphore = asyncio.Semaphore(8)
+        results = await asyncio.gather(
+            *(rest_poll_symbol(HTTP_CLIENT, s, semaphore) for s in STATE.symbols),
+            return_exceptions=True,
+        )
+        new_bars = sum(r for r in results if isinstance(r, int))
+        STATE.rest_poll_active = True
+        STATE.rest_poll_last_at = time.time()
+        elapsed = time.monotonic() - started
+        logger.info(
+            "REST poll: sembol=%d yeni_bar=%d süre=%.1fs",
+            len(STATE.symbols),
+            new_bars,
+            elapsed,
+        )
+        sleep_for = max(5.0, SCAN_INTERVAL_SECONDS - elapsed)
+        await asyncio.sleep(sleep_for)
+
+
 async def backfill_all(symbols: list[str]) -> None:
     """Tüm semboller için paralel backfill."""
     assert HTTP_CLIENT is not None
@@ -457,6 +568,7 @@ async def backfill_all(symbols: list[str]) -> None:
     await asyncio.gather(
         *(backfill_symbol(HTTP_CLIENT, s, semaphore) for s in symbols)
     )
+    STATE.backfill_complete = True
     logger.info(
         "REST backfill tamamlandı: %.1fs",
         time.monotonic() - started,
@@ -617,6 +729,30 @@ def _drop_forming_candle(df: pd.DataFrame | None, period: str) -> pd.DataFrame |
     if last_close_ms > now_ms:
         return df.iloc[:-1].copy()
     return df
+
+
+def _merge_rest_frames(
+    existing: pd.DataFrame | None,
+    incoming: pd.DataFrame,
+    period: str,
+) -> pd.DataFrame:
+    """REST poll yanıtını mevcut frame'e birleştirir; kapalı bar hizası korunur."""
+    incoming = _drop_forming_candle(incoming.copy(), period)
+    if incoming is None or incoming.empty:
+        return existing if existing is not None else incoming
+
+    if existing is None or existing.empty:
+        merged = incoming
+    else:
+        merged = pd.concat([existing, incoming])
+        merged = merged[~merged.index.duplicated(keep="last")]
+        merged.sort_index(inplace=True)
+
+    cap = _max_bars_for_period(period)
+    if len(merged) > cap:
+        merged = merged.iloc[-cap:].copy()
+    cleaned = _drop_forming_candle(merged, period)
+    return cleaned if cleaned is not None else merged
 
 
 def _snapshot_df(
@@ -1369,6 +1505,7 @@ async def update_all_summaries() -> int:
         depth_skipped,
         elapsed,
     )
+    STATE.last_scan_at = time.time()
     return new_signal_count
 
 
@@ -1432,6 +1569,7 @@ async def lifespan(_: FastAPI):
     try:
         groups = await get_market_caps()
     except MarketCapError as exc:
+        STATE.startup_error = str(exc)
         logger.error(
             "Başlangıçta Binance sembol evreni alınamadı: %s. "
             "Sembol listesi boş başlayacak.",
@@ -1455,9 +1593,14 @@ async def lifespan(_: FastAPI):
             "Veri tazeleme: GET /cron/refresh (Vercel Cron veya manuel)."
         )
     elif STATE.symbols:
-        await backfill_all(STATE.symbols)
+        background_tasks.append(
+            asyncio.create_task(backfill_all(STATE.symbols), name="backfill")
+        )
         background_tasks.append(
             asyncio.create_task(websocket_listener(STATE.symbols), name="ws_listener")
+        )
+        background_tasks.append(
+            asyncio.create_task(rest_poll_loop(), name="rest_poll")
         )
         background_tasks.append(asyncio.create_task(summary_loop(), name="summary_loop"))
         background_tasks.append(asyncio.create_task(mcap_refresh_loop(), name="mcap_refresh"))
@@ -1537,12 +1680,28 @@ async def health() -> dict[str, Any]:
         "vercel_ready": _vercel_ready if IS_VERCEL else True,
         "summaries_count": len(STATE.symbol_summaries),
         "ws_connected": STATE.ws_connected,
+        "data_mode": (
+            "websocket"
+            if STATE.ws_connected
+            else "rest_poll"
+            if STATE.rest_poll_active
+            else "backfill_only"
+        ),
+        "rest_poll_active": STATE.rest_poll_active,
+        "rest_poll_last_age_sec": (
+            time.time() - STATE.rest_poll_last_at
+            if STATE.rest_poll_last_at
+            else None
+        ),
         "ws_last_message_age_sec": (
             time.time() - STATE.ws_last_message_at
             if STATE.ws_last_message_at
             else None
         ),
         "symbols_tracked": len(STATE.symbols),
+        "backfill_complete": STATE.backfill_complete,
+        "startup_error": STATE.startup_error,
+        "rest_endpoints": list(REST_BASE_URLS),
         "groups_breakdown": {
             group: len(syms) for group, syms in STATE.groups.items()
         },
